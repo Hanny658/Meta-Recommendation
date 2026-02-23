@@ -856,7 +856,7 @@ def create_debug_router(service_getter: Callable[[], Any]) -> APIRouter:
         return rec
 
     @router.post("/behavior-tests/{run_id}/explain")
-    async def explain_endpoint(run_id: str, _: Dict[str, Any] = Depends(require_auth), payload: ExplainRequest = ExplainRequest()):
+    async def explain_endpoint(run_id: str, payload: ExplainRequest, _: Dict[str, Any] = Depends(require_auth)):
         require_enabled()
         if not explain_enabled:
             raise HTTPException(status_code=400, detail="LLM explanation disabled")
