@@ -32,6 +32,7 @@ logging.getLogger("uvicorn.access").setLevel(logging.INFO)
 # 导入核心服务
 from service import MetaRecService
 from conversation_storage import get_storage
+from debug_router import create_debug_router
 
 # 导入 LLM 服务
 try:
@@ -58,6 +59,7 @@ app.add_middleware(
 # ==================== 创建服务实例 ====================
 # 这是全局服务实例，可以被所有路由使用
 metarec_service = MetaRecService()
+app.include_router(create_debug_router(lambda: metarec_service))
 
 # ==================== Conversation Preferences 内存缓存 ====================
 # 存储格式: {f"{user_id}:{conversation_id}": preferences_dict}
