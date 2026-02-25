@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import type { DebugConfig, DebugRunDetail, DebugRunSummary, DebugUnitSpec } from '../utils/types'
-import './DebugPage.css'
+import '../style/DebugPage.css'
 import {
   debugLogin,
   debugLogout,
@@ -26,6 +26,7 @@ function pretty(value: any): string {
 }
 
 export function DebugPage(): JSX.Element {
+  const [toast, setToast] = useState<{ message: string; kind: 'info' | 'success' | 'warning' | 'error' } | null>(null)
   const [config, setConfig] = useState<DebugConfig | null>(null)
   const [sessionReady, setSessionReady] = useState(false)
   const [authed, setAuthed] = useState(false)
@@ -54,6 +55,12 @@ export function DebugPage(): JSX.Element {
   const [unitRunResult, setUnitRunResult] = useState<any>(null)
   const [unitError, setUnitError] = useState<string | null>(null)
   const unitInputTouchedRef = useRef(false)
+
+  useEffect(() => {
+    if (!toast) return
+    const timer = window.setTimeout(() => setToast(null), 4000)
+    return () => window.clearTimeout(timer)
+  }, [toast])
 
   useEffect(() => {
     let cancelled = false
@@ -185,7 +192,14 @@ export function DebugPage(): JSX.Element {
       await refreshRuns()
       setSelectedRunId(result.run_id)
     } catch (e: any) {
-      setRunError(e?.message || 'Failed to track task')
+      const message = e?.message || 'Failed to track task'
+      setRunError(message)
+      if (message.toLowerCase().includes('task id not found') || message.toLowerCase().includes('task not found')) {
+        setToast({
+          kind: 'warning',
+          message: `Task not found: "${trackTaskId.trim()}". No tracking run was created.`,
+        })
+      }
     }
   }
 
@@ -204,6 +218,7 @@ export function DebugPage(): JSX.Element {
   }
 
   const onGenerateUnitInput = async (mode: 'sample' | 'schema' | 'llm') => {
+    // refers to backend DebugRoute's private function _generate_unit_input()
     if (!selectedUnit) return
     setUnitError(null)
     try {
@@ -260,6 +275,17 @@ export function DebugPage(): JSX.Element {
 
   return (
     <div className="debug-page">
+      {toast && (
+        <div className={`debug-toast ${toast.kind}`} role="status" aria-live="polite">
+          <div className="debug-toast-content">
+            <strong>{toast.kind === 'warning' ? 'Notice' : 'Debug'}</strong>
+            <span>{toast.message}</span>
+          </div>
+          <button className="debug-toast-close" onClick={() => setToast(null)} aria-label="Dismiss notification">
+            ×
+          </button>
+        </div>
+      )}
       <header className="debug-header">
         <div>
           <h1>MetaRec Internal Debug / Testbench</h1>
@@ -384,15 +410,15 @@ export function DebugPage(): JSX.Element {
             )}
           </section>
 
-          <section className="debug-panel debug-panel-wide">
+          <section className="debug-panel debug-panel-wide debug-panel-full-span">
             <div className="debug-panel-title-row">
               <h2>Interactive Unit Testbench</h2>
               <div className="debug-row">
                 <button className="debug-secondary" onClick={() => refreshUnits()}>Refresh Units</button>
               </div>
             </div>
-            <div className="debug-unit-grid">
-              <div>
+            <div className="debug-unit-layout">
+              <div className="debug-unit-left">
                 <label>Registered Units</label>
                 <select
                   value={selectedUnitName}
@@ -424,9 +450,6 @@ export function DebugPage(): JSX.Element {
                     </details>
                   </>
                 )}
-              </div>
-
-              <div>
                 <label>Input Mode</label>
                 <select value={unitInputMode} onChange={(e) => setUnitInputMode(e.target.value as any)}>
                   <option value="manual">Manual JSON</option>
@@ -453,10 +476,13 @@ export function DebugPage(): JSX.Element {
                 </div>
                 {unitError && <div className="debug-error">{unitError}</div>}
               </div>
-            </div>
-            <div className="debug-unit-result">
-              <h3>Result</h3>
-              <pre>{unitRunResult ? pretty(unitRunResult) : 'No unit run yet.'}</pre>
+
+              <div className="debug-unit-right">
+                <div className="debug-unit-result">
+                  <h3>Output</h3>
+                  <pre>{unitRunResult ? pretty(unitRunResult) : 'No unit run yet.'}</pre>
+                </div>
+              </div>
             </div>
           </section>
         </div>

@@ -1,7 +1,7 @@
 import type { DebugConfig, DebugRunDetail, DebugRunSummary, DebugSession, DebugUnitSpec } from './types'
 
 const BASE_URL = import.meta.env.VITE_API_BASE_URL ||
-  (import.meta.env.PROD ? '' : 'http://localhost:8000')
+  (import.meta.env.PROD ? '' : 'http://localhost:8000') // I guess I'd better follow what api.ts is doing
 
 async function debugFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE_URL}${path}`, {

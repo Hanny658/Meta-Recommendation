@@ -524,7 +524,7 @@ async def _generate_llm_input(unit_spec: UnitSpec) -> Optional[Dict[str, Any]]:
     if debug_llm_client is None or not DEBUG_LLM_MODEL:
         return None
     prompt = (
-        "Generate one JSON object satisfying this schema. Return JSON only.\n"
+        "Generate one JSON object satisfying this schema that asks about a Point of Interest including type and place. Return JSON only.\n"
         f"{json.dumps(unit_spec.input_schema, ensure_ascii=False)}"
     )
     try:
@@ -559,6 +559,27 @@ def _debug_user(user_id: str, run_id: str) -> str:
 
 def _debug_session(session_id: Optional[str], run_id: str) -> str:
     return session_id or f"debug_session_{run_id[:8]}"
+
+
+def _get_confirmation_message(response_obj: Any) -> str:
+    """
+    Support both dict payloads and Pydantic models for confirmation_request.
+    """
+    if response_obj is None:
+        return ""
+    if isinstance(response_obj, dict):
+        confirmation = response_obj.get("confirmation_request")
+        if isinstance(confirmation, dict):
+            return str(confirmation.get("message", "") or "")
+        if confirmation is not None:
+            return str(getattr(confirmation, "message", "") or "")
+        return ""
+    confirmation = getattr(response_obj, "confirmation_request", None)
+    if confirmation is None:
+        return ""
+    if isinstance(confirmation, dict):
+        return str(confirmation.get("message", "") or "")
+    return str(getattr(confirmation, "message", "") or "")
 
 
 def create_debug_router(service_getter: Callable[[], Any]) -> APIRouter:
@@ -691,12 +712,13 @@ def create_debug_router(service_getter: Callable[[], Any]) -> APIRouter:
 
             if current.get("type") == "confirmation" and req.auto_confirm:
                 t1 = time.perf_counter()
+                confirmation_message = _get_confirmation_message(current)
                 confirm_resp = await service.handle_user_request_async(
                     req.confirm_message,
                     user_id=user_id,
                     conversation_history=[
                         {"role": "user", "content": req.query},
-                        {"role": "assistant", "content": current.get("confirmation_request", {}).get("message", "")},
+                        {"role": "assistant", "content": confirmation_message},
                     ],
                     session_id=session_id,
                     use_online_agent=req.use_online_agent,
@@ -840,6 +862,10 @@ def create_debug_router(service_getter: Callable[[], Any]) -> APIRouter:
 
     @router.post("/behavior-tests/track")
     async def start_track(req: BehaviorTrackRequest, _: Dict[str, Any] = Depends(require_auth)):
+        # Preflight existence check: do not create a debug tracking run for a non-existent task.
+        existing = service_getter().get_task_status(req.task_id, req.user_id, req.conversation_id)
+        if existing is None:
+            raise HTTPException(status_code=404, detail="Task ID not found; no tracking run created")
         rec = trace_storage.create_run("behavior_track", req.model_dump())
         jobs[rec["id"]] = asyncio.create_task(run_behavior_track(rec["id"], req))
         return {"ok": True, "run_id": rec["id"], "status": rec["status"]}
