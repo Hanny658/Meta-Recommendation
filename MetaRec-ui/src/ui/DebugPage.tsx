@@ -623,13 +623,16 @@ export function DebugPage(): JSX.Element {
         body = JSON.stringify(bodyObj ?? {})
       }
 
+      const controller = new AbortController()
+      const timeoutId = window.setTimeout(() => controller.abort(), 120_000)
       const started = performance.now()
       const res = await fetch(url, {
         method: selectedApiOp.method,
         credentials: 'include',
         headers,
         body,
-      })
+        signal: controller.signal,
+      }).finally(() => window.clearTimeout(timeoutId))
       const durationMs = Math.round(performance.now() - started)
       const text = await res.text().catch(() => '')
       let parsed: any = null
@@ -667,7 +670,11 @@ export function DebugPage(): JSX.Element {
         duration_ms: durationMs,
       })
     } catch (e: any) {
-      setApiPlaygroundError(e?.message || 'Failed to run API request')
+      if (e?.name === 'AbortError') {
+        setApiPlaygroundError('API request timed out after 120s')
+      } else {
+        setApiPlaygroundError(e?.message || 'Failed to run API request')
+      }
     } finally {
       setApiRunning(false)
     }

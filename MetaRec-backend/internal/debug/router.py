@@ -221,6 +221,30 @@ class DebugSessionStore:
             self._sessions.pop(sid, None)
 
 
+class DebugRateLimiter:
+    """
+    Simple in-memory sliding-window rate limiter keyed by session/action.
+    Suitable for internal debug endpoints only (process-local state).
+    """
+    def __init__(self):
+        self._events: Dict[str, List[float]] = {}
+        self._lock = Lock()
+
+    def allow(self, key: str, *, limit: int, window_seconds: int) -> Tuple[bool, int]:
+        limit = max(1, int(limit))
+        window_seconds = max(1, int(window_seconds))
+        now = time.monotonic()
+        with self._lock:
+            events = [ts for ts in self._events.get(key, []) if (now - ts) < window_seconds]
+            if len(events) >= limit:
+                retry_after = max(1, int(window_seconds - (now - events[0])) + 1)
+                self._events[key] = events
+                return False, retry_after
+            events.append(now)
+            self._events[key] = events
+            return True, 0
+
+
 class DebugConfig(BaseModel):
     enabled: bool
     llm_explain_enabled: bool
@@ -463,6 +487,7 @@ def create_debug_router(service_getter: Callable[[], Any]) -> APIRouter:
     router = APIRouter(prefix="/internal/debug", tags=["internal-debug"])
     trace_storage = DebugTraceStorage()
     session_store = DebugSessionStore()
+    rate_limiter = DebugRateLimiter()
     unit_registry = UnitRegistry(service_getter)
     jobs: Dict[str, asyncio.Task] = {}
 
@@ -473,6 +498,11 @@ def create_debug_router(service_getter: Callable[[], Any]) -> APIRouter:
     debug_admin_token = os.getenv("DEBUG_ADMIN_TOKEN", "")
     debug_admin_token_hash = os.getenv("DEBUG_ADMIN_TOKEN_HASH", "")
     session_ttl_hours = int(os.getenv("DEBUG_SESSION_TTL_HOURS", "8"))
+    debug_exec_timeout_seconds = max(1, int(os.getenv("DEBUG_EXEC_TIMEOUT_SECONDS", "120")))
+    llm_gen_rate_limit_count = max(1, int(os.getenv("DEBUG_LLM_GEN_RATE_LIMIT_COUNT", "10")))
+    llm_gen_rate_limit_window_seconds = max(1, int(os.getenv("DEBUG_LLM_GEN_RATE_LIMIT_WINDOW_SECONDS", "60")))
+    llm_explain_rate_limit_count = max(1, int(os.getenv("DEBUG_LLM_EXPLAIN_RATE_LIMIT_COUNT", "3")))
+    llm_explain_rate_limit_window_seconds = max(1, int(os.getenv("DEBUG_LLM_EXPLAIN_RATE_LIMIT_WINDOW_SECONDS", "300")))
 
     def require_enabled() -> None:
         if not debug_enabled:
@@ -497,6 +527,48 @@ def create_debug_router(service_getter: Callable[[], Any]) -> APIRouter:
         if not session:
             raise HTTPException(status_code=401, detail="Debug session expired")
         return session
+
+    def enforce_rate_limit(session: Dict[str, Any], *, action: str, limit: int, window_seconds: int) -> None:
+        session_id = str(session.get("id", "anonymous"))
+        allowed, retry_after = rate_limiter.allow(
+            f"{session_id}:{action}",
+            limit=limit,
+            window_seconds=window_seconds,
+        )
+        if not allowed:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Rate limit exceeded for {action}. Retry after {retry_after}s.",
+                headers={"Retry-After": str(retry_after)},
+            )
+
+    async def with_debug_timeout(coro: Any, *, label: str):
+        try:
+            return await asyncio.wait_for(coro, timeout=debug_exec_timeout_seconds)
+        except asyncio.TimeoutError:
+            raise HTTPException(status_code=504, detail=f"{label} timed out after {debug_exec_timeout_seconds}s")
+
+    async def run_job_with_timeout(run_id: str, job_coro: Any, *, label: str) -> None:
+        try:
+            await asyncio.wait_for(job_coro, timeout=debug_exec_timeout_seconds)
+        except asyncio.TimeoutError:
+            trace_storage.append_event(
+                run_id,
+                event_type="timeout",
+                label=f"{label} timed out",
+                status="error",
+                data={"timeout_seconds": debug_exec_timeout_seconds},
+            )
+            trace_storage.update(run_id, status="timeout", error=f"{label} timed out after {debug_exec_timeout_seconds}s")
+        except Exception as exc:
+            trace_storage.append_event(
+                run_id,
+                event_type="debug_job",
+                label=f"{label} failed",
+                status="error",
+                data={"error": str(exc), "traceback": traceback.format_exc()},
+            )
+            trace_storage.update(run_id, status="error", error=str(exc))
 
     def record_artifact(run_id: str, key: str, value: Any) -> None:
         rec = trace_storage.load(run_id)
@@ -733,8 +805,11 @@ def create_debug_router(service_getter: Callable[[], Any]) -> APIRouter:
 
     @router.post("/behavior-tests")
     async def start_behavior(req: BehaviorTestCreateRequest, _: Dict[str, Any] = Depends(require_auth)):
+        req.max_wait_seconds = min(req.max_wait_seconds, debug_exec_timeout_seconds)
         rec = trace_storage.create_run("behavior_create", req.model_dump())
-        jobs[rec["id"]] = asyncio.create_task(run_behavior_create(rec["id"], req))
+        jobs[rec["id"]] = asyncio.create_task(
+            run_job_with_timeout(rec["id"], run_behavior_create(rec["id"], req), label="Behavior create run")
+        )
         return {"ok": True, "run_id": rec["id"], "status": rec["status"]}
 
     @router.post("/behavior-tests/track")
@@ -743,8 +818,11 @@ def create_debug_router(service_getter: Callable[[], Any]) -> APIRouter:
         existing = service_getter().get_task_status(req.task_id, req.user_id, req.conversation_id)
         if existing is None:
             raise HTTPException(status_code=404, detail="Task ID not found; no tracking run created")
+        req.max_wait_seconds = min(req.max_wait_seconds, debug_exec_timeout_seconds)
         rec = trace_storage.create_run("behavior_track", req.model_dump())
-        jobs[rec["id"]] = asyncio.create_task(run_behavior_track(rec["id"], req))
+        jobs[rec["id"]] = asyncio.create_task(
+            run_job_with_timeout(rec["id"], run_behavior_track(rec["id"], req), label="Behavior track run")
+        )
         return {"ok": True, "run_id": rec["id"], "status": rec["status"]}
 
     @router.get("/behavior-tests/{run_id}")
@@ -759,12 +837,18 @@ def create_debug_router(service_getter: Callable[[], Any]) -> APIRouter:
         return rec
 
     @router.post("/behavior-tests/{run_id}/explain")
-    async def explain_endpoint(run_id: str, payload: ExplainRequest, _: Dict[str, Any] = Depends(require_auth)):
+    async def explain_endpoint(run_id: str, payload: ExplainRequest, session: Dict[str, Any] = Depends(require_auth)):
         require_enabled()
         if not explain_enabled:
             raise HTTPException(status_code=400, detail="LLM explanation disabled")
+        enforce_rate_limit(
+            session,
+            action="llm_explain",
+            limit=llm_explain_rate_limit_count,
+            window_seconds=llm_explain_rate_limit_window_seconds,
+        )
         try:
-            explanation = await explain_trace(run_id)
+            explanation = await with_debug_timeout(explain_trace(run_id), label="LLM explanation")
             return {"ok": True, "mode": payload.mode, "explanation": explanation}
         except HTTPException:
             raise
@@ -777,12 +861,19 @@ def create_debug_router(service_getter: Callable[[], Any]) -> APIRouter:
         return {"units": unit_registry.list_specs()}
 
     @router.post("/unit-tests/generate-input")
-    async def generate_unit_input(payload: UnitInputGenerateRequest, _: Dict[str, Any] = Depends(require_auth)):
+    async def generate_unit_input(payload: UnitInputGenerateRequest, session: Dict[str, Any] = Depends(require_auth)):
         try:
             spec = unit_registry.get_spec(payload.unit_name)
         except KeyError:
             raise HTTPException(status_code=404, detail="Unit not found")
-        generated = await _generate_unit_input(spec, payload.mode)
+        if payload.mode == "llm":
+            enforce_rate_limit(
+                session,
+                action="llm_generate_unit_input",
+                limit=llm_gen_rate_limit_count,
+                window_seconds=llm_gen_rate_limit_window_seconds,
+            )
+        generated = await with_debug_timeout(_generate_unit_input(spec, payload.mode), label="Unit input generation")
         return {
             "ok": True,
             "unit": spec.name,
@@ -792,7 +883,7 @@ def create_debug_router(service_getter: Callable[[], Any]) -> APIRouter:
         }
 
     @router.post("/unit-tests/run")
-    async def run_unit(payload: UnitRunRequest, _: Dict[str, Any] = Depends(require_auth)):
+    async def run_unit(payload: UnitRunRequest, session: Dict[str, Any] = Depends(require_auth)):
         try:
             spec = unit_registry.get_spec(payload.unit_name)
         except KeyError:
@@ -801,7 +892,14 @@ def create_debug_router(service_getter: Callable[[], Any]) -> APIRouter:
         input_data = payload.input_data
         if input_data is None or input_mode in {"sample", "schema"} or payload.use_llm_generation:
             input_mode = "llm" if payload.use_llm_generation else input_mode
-            input_data = await _generate_unit_input(spec, input_mode)
+            if input_mode == "llm":
+                enforce_rate_limit(
+                    session,
+                    action="llm_generate_unit_input",
+                    limit=llm_gen_rate_limit_count,
+                    window_seconds=llm_gen_rate_limit_window_seconds,
+                )
+            input_data = await with_debug_timeout(_generate_unit_input(spec, input_mode), label="Unit input generation")
         if not isinstance(input_data, dict):
             raise HTTPException(status_code=400, detail="input_data must be an object")
         return {
@@ -810,14 +908,21 @@ def create_debug_router(service_getter: Callable[[], Any]) -> APIRouter:
             "input_source": input_mode,
             "input_data": _sanitize(input_data),
             "validation_errors": _validate_schema(input_data, spec.input_schema),
-            "result": await unit_registry.run(spec.name, input_data),
+            "result": await with_debug_timeout(unit_registry.run(spec.name, input_data), label="Unit test execution"),
         }
 
     @router.post("/api-playground/generate-input")
-    async def generate_api_playground_input(payload: ApiPlaygroundInputGenerateRequest, _: Dict[str, Any] = Depends(require_auth)):
+    async def generate_api_playground_input(payload: ApiPlaygroundInputGenerateRequest, session: Dict[str, Any] = Depends(require_auth)):
         if payload.mode not in {"schema", "llm"}:
             raise HTTPException(status_code=400, detail="mode must be 'schema' or 'llm'")
-        generated = await _generate_api_playground_input(payload)
+        if payload.mode == "llm":
+            enforce_rate_limit(
+                session,
+                action="llm_generate_api_input",
+                limit=llm_gen_rate_limit_count,
+                window_seconds=llm_gen_rate_limit_window_seconds,
+            )
+        generated = await with_debug_timeout(_generate_api_playground_input(payload), label="API playground input generation")
         return {
             "ok": True,
             "mode": payload.mode,
