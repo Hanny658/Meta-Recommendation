@@ -7,7 +7,6 @@ import inspect
 import json
 import os
 import secrets
-import tempfile
 import time
 import traceback
 import uuid
@@ -19,7 +18,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
-from conversation_storage import ConversationStorage
+from .unit_registry import UnitSpec, register_default_debug_units
 
 try:
     from llm_service import client as debug_llm_client, LLM_MODEL as DEBUG_LLM_MODEL
@@ -87,7 +86,9 @@ def _sanitize(value: Any) -> Any:
 
 class DebugTraceStorage:
     def __init__(self, storage_dir: str = "debug_traces"):
-        self.base_dir = Path(__file__).parent / storage_dir
+        # Keep trace storage at backend root (MetaRec-backend/debug_traces)
+        # even though this module now lives under internal/debug/.
+        self.base_dir = Path(__file__).resolve().parents[2] / storage_dir
         self.base_dir.mkdir(exist_ok=True)
         self._lock = Lock()
 
@@ -266,167 +267,16 @@ class UnitInputGenerateRequest(BaseModel):
     mode: str = "schema"  # schema | sample | llm
 
 
-class UnitSpec(BaseModel):
-    name: str
-    description: str
-    function_name: str
-    input_schema: Dict[str, Any]
-    expected_io: Dict[str, Any]
-    sample_input: Dict[str, Any]
-
-
 class UnitRegistry:
     def __init__(self, service_getter: Callable[[], Any]):
         self._service_getter = service_getter
         self._specs: Dict[str, UnitSpec] = {}
         self._handlers: Dict[str, Callable[[Dict[str, Any]], Any]] = {}
-        self._register_defaults()
+        register_default_debug_units(self, service_getter)
 
-    def _register(self, spec: UnitSpec, handler: Callable[[Dict[str, Any]], Any]) -> None:
+    def register(self, spec: UnitSpec, handler: Callable[[Dict[str, Any]], Any]) -> None:
         self._specs[spec.name] = spec
         self._handlers[spec.name] = handler
-
-    def _register_defaults(self) -> None:
-        self._register(
-            UnitSpec(
-                name="metarec.analyze_user_intent",
-                description="Rule-based fallback intent classifier for confirmation/new query.",
-                function_name="MetaRecService.analyze_user_intent",
-                input_schema={"type": "object", "required": ["query"], "properties": {"query": {"type": "string", "minLength": 1}}},
-                expected_io={"output_type": "object", "notes": "Returns type/confidence/original_query"},
-                sample_input={"query": "I want spicy Sichuan in Chinatown"},
-            ),
-            lambda p: self._service_getter().analyze_user_intent(p["query"]),
-        )
-        self._register(
-            UnitSpec(
-                name="metarec.extract_preferences_from_query",
-                description="Rule-based preference extraction used as fallback and baseline behavior parser.",
-                function_name="MetaRecService.extract_preferences_from_query",
-                input_schema={
-                    "type": "object",
-                    "required": ["query"],
-                    "properties": {
-                        "query": {"type": "string", "minLength": 1},
-                        "user_id": {"type": "string"},
-                        "session_id": {"type": "string"},
-                    },
-                },
-                expected_io={"output_type": "object", "notes": "Preferences dict"},
-                sample_input={"query": "spicy Sichuan for friends around Chinatown budget 20 to 60"},
-            ),
-            lambda p: self._service_getter().extract_preferences_from_query(
-                p["query"], p.get("user_id", "debug_unit"), p.get("session_id", "debug_unit_session")
-            ),
-        )
-        self._register(
-            UnitSpec(
-                name="metarec.preferences_to_agent_input",
-                description="Converts query + preferences into planner JSON text.",
-                function_name="MetaRecService._preferences_to_agent_input",
-                input_schema={
-                    "type": "object",
-                    "required": ["query", "preferences"],
-                    "properties": {"query": {"type": "string"}, "preferences": {"type": "object"}},
-                },
-                expected_io={"output_type": "string", "notes": "JSON string for planner"},
-                sample_input={
-                    "query": "Find spicy Sichuan for friends in Chinatown",
-                    "preferences": {
-                        "restaurant_types": ["casual"],
-                        "flavor_profiles": ["spicy"],
-                        "dining_purpose": "friends",
-                        "budget_range": {"min": 20, "max": 60, "currency": "SGD", "per": "person"},
-                        "location": "Chinatown",
-                    },
-                },
-            ),
-            lambda p: self._service_getter()._preferences_to_agent_input(p.get("query", ""), p["preferences"]),
-        )
-        self._register(
-            UnitSpec(
-                name="metarec.extract_restaurants_from_execution_data",
-                description="Parses summary + executions into frontend restaurant objects.",
-                function_name="MetaRecService._extract_restaurants_from_execution_data",
-                input_schema={"type": "object", "required": ["execution_data"], "properties": {"execution_data": {"type": "object"}}},
-                expected_io={"output_type": "array", "notes": "Restaurant dicts merged from summary and Google Maps"},
-                sample_input={
-                    "execution_data": {
-                        "summary": {
-                            "recommendations": [
-                                {
-                                    "name": "Test Sichuan House",
-                                    "area": "Chinatown",
-                                    "cuisine": "Sichuan",
-                                    "price_per_person_sgd": "20-35",
-                                    "why": "Fits spicy budget",
-                                    "sources": {"xiaohongshu": "note_1"},
-                                }
-                            ]
-                        },
-                        "executions": [
-                            {
-                                "tool": "gmap.search",
-                                "success": True,
-                                "output": [
-                                    {
-                                        "title": "Test Sichuan House Singapore",
-                                        "rating": 4.3,
-                                        "reviews": 231,
-                                        "price": "$$",
-                                        "address": "72 Pagoda St",
-                                        "gps_coordinates": {"latitude": 1.28, "longitude": 103.84},
-                                        "open_state": "Open now",
-                                    }
-                                ],
-                            }
-                        ],
-                    }
-                },
-            ),
-            lambda p: self._service_getter()._extract_restaurants_from_execution_data(p["execution_data"]),
-        )
-        self._register(
-            UnitSpec(
-                name="conversation_storage.sandbox_lifecycle",
-                description="Temp-dir conversation CRUD sandbox (isolated from production conversation files).",
-                function_name="ConversationStorage lifecycle",
-                input_schema={
-                    "type": "object",
-                    "required": ["user_id", "message"],
-                    "properties": {
-                        "user_id": {"type": "string"},
-                        "message": {"type": "string"},
-                        "title": {"type": "string"},
-                        "preferences": {"type": "object"},
-                    },
-                },
-                expected_io={"output_type": "object", "notes": "Returns final conversation snapshot"},
-                sample_input={
-                    "user_id": "unit_user",
-                    "message": "I want spicy food",
-                    "title": "Debug Sandbox",
-                    "preferences": {"flavor_profiles": ["spicy"], "location": "Chinatown"},
-                },
-            ),
-            self._conversation_sandbox_lifecycle,
-        )
-
-    def _conversation_sandbox_lifecycle(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        with tempfile.TemporaryDirectory(prefix="metarec_debug_conv_") as tmpdir:
-            storage = ConversationStorage(storage_dir=tmpdir)
-            conv = storage.create_conversation(
-                user_id=payload.get("user_id", "unit_user"),
-                title=payload.get("title", "Debug Sandbox"),
-                model="DebugUnit",
-            )
-            storage.add_message(payload.get("user_id", "unit_user"), conv["id"], "user", payload.get("message", "Hello"))
-            if payload.get("preferences"):
-                storage.update_conversation_preferences(payload.get("user_id", "unit_user"), conv["id"], payload["preferences"])
-            return {
-                "conversation_id": conv["id"],
-                "conversation": storage.get_full_conversation(payload.get("user_id", "unit_user"), conv["id"]),
-            }
 
     def list_specs(self) -> List[Dict[str, Any]]:
         return [spec.model_dump() for spec in self._specs.values()]
@@ -524,14 +374,14 @@ async def _generate_llm_input(unit_spec: UnitSpec) -> Optional[Dict[str, Any]]:
     if debug_llm_client is None or not DEBUG_LLM_MODEL:
         return None
     prompt = (
-        "Generate one JSON object satisfying this schema that asks about a Point of Interest including type and place. Return JSON only.\n"
+        "Generate one JSON object satisfying the schema with some dummy meaningful data to test this Restaurant Recommender System.\n"
         f"{json.dumps(unit_spec.input_schema, ensure_ascii=False)}"
     )
     try:
         resp = await debug_llm_client.chat.completions.create(
             model=DEBUG_LLM_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
+            temperature=1.0,
             response_format={"type": "json_object"},
         )
         content = resp.choices[0].message.content if resp and resp.choices else ""
