@@ -1,10 +1,10 @@
 import type { DebugConfig, DebugRunDetail, DebugRunSummary, DebugSession, DebugUnitSpec } from './types'
 
-const BASE_URL = import.meta.env.VITE_API_BASE_URL ||
+export const DEBUG_BASE_URL = import.meta.env.VITE_API_BASE_URL ||
   (import.meta.env.PROD ? '' : 'http://localhost:8000') // I guess I'd better follow what api.ts is doing
 
 async function debugFetch<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${BASE_URL}${path}`, {
+  const res = await fetch(`${DEBUG_BASE_URL}${path}`, {
     credentials: 'include',
     headers: {
       'Content-Type': 'application/json',
@@ -22,6 +22,10 @@ async function debugFetch<T>(path: string, init?: RequestInit): Promise<T> {
     throw new Error(`HTTP ${res.status} ${res.statusText}${detail ? `: ${detail}` : ''}`)
   }
   return parse() as T
+}
+
+export async function fetchOpenApiSpec(): Promise<any> {
+  return debugFetch('/openapi.json', { method: 'GET' })
 }
 
 export function getDebugConfig(): Promise<DebugConfig> {
@@ -110,3 +114,15 @@ export async function runDebugUnit(payload: {
   })
 }
 
+export async function generateDebugApiPlaygroundInput(payload: {
+  mode: 'schema' | 'llm'
+  schema: Record<string, any>
+  method?: string
+  path?: string
+  summary?: string
+}): Promise<{ ok: boolean; mode: string; input_data: any; validation_errors: string[] }> {
+  return debugFetch('/internal/debug/api-playground/generate-input', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}

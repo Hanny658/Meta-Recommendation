@@ -1,11 +1,14 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
-import type { DebugConfig, DebugRunDetail, DebugRunSummary, DebugUnitSpec } from '../utils/types'
-import './DebugPage.css'
+import type { DebugConfig, DebugRunDetail, DebugRunSummary, DebugUnitSpec, OpenApiSpec } from '../utils/types'
+import '../style/DebugPage.css'
 import {
+  DEBUG_BASE_URL,
   debugLogin,
   debugLogout,
   explainBehaviorDebugRun,
+  fetchOpenApiSpec,
+  generateDebugApiPlaygroundInput,
   generateDebugUnitInput,
   getBehaviorDebugRun,
   getDebugConfig,
@@ -83,10 +86,158 @@ function renderStructuredValue(value: any, depth = 0): JSX.Element {
   )
 }
 
+type ApiOperationParam = {
+  name: string
+  in: 'path' | 'query' | string
+  required?: boolean
+  description?: string
+  schema?: Record<string, any>
+}
+
+type ApiOperation = {
+  id: string
+  method: string
+  path: string
+  summary: string
+  description?: string
+  tags: string[]
+  operationId?: string
+  parameters: ApiOperationParam[]
+  requestBodySchema?: Record<string, any> | null
+  requestBodyRequired?: boolean
+  requestContentType?: string | null
+  responses?: Record<string, any>
+}
+
+function resolveRef(ref: string, spec: OpenApiSpec): any {
+  if (!ref.startsWith('#/')) return null
+  const parts = ref.slice(2).split('/')
+  let current: any = spec
+  for (const part of parts) {
+    current = current?.[part]
+    if (current === undefined) return null
+  }
+  return current
+}
+
+function resolveSchema(schema: any, spec: OpenApiSpec, seen = new Set<string>()): any {
+  if (!schema || typeof schema !== 'object') return schema
+  if (schema.$ref && typeof schema.$ref === 'string') {
+    if (seen.has(schema.$ref)) return { type: 'object' }
+    seen.add(schema.$ref)
+    const target = resolveRef(schema.$ref, spec)
+    const resolved = resolveSchema(target, spec, seen)
+    const { $ref: _, ...rest } = schema
+    return { ...(resolved || {}), ...rest }
+  }
+  if (Array.isArray(schema.allOf)) {
+    return schema.allOf.reduce((acc: any, part: any) => {
+      const resolved = resolveSchema(part, spec, seen)
+      return { ...(acc || {}), ...(resolved || {}) }
+    }, {})
+  }
+  const next: any = { ...schema }
+  if (next.items) next.items = resolveSchema(next.items, spec, seen)
+  if (next.properties && typeof next.properties === 'object') {
+    const props: Record<string, any> = {}
+    for (const [k, v] of Object.entries(next.properties)) {
+      props[k] = resolveSchema(v, spec, new Set(seen))
+    }
+    next.properties = props
+  }
+  return next
+}
+
+function buildApiOperations(spec: OpenApiSpec | null): ApiOperation[] {
+  if (!spec?.paths || typeof spec.paths !== 'object') return []
+  const out: ApiOperation[] = []
+  for (const [path, pathItem] of Object.entries(spec.paths as Record<string, any>)) {
+    if (!pathItem || typeof pathItem !== 'object') continue
+    const pathLevelParams = Array.isArray((pathItem as any).parameters) ? (pathItem as any).parameters : []
+    for (const method of ['get', 'post', 'put', 'patch', 'delete', 'options', 'head']) {
+      const op = (pathItem as any)[method]
+      if (!op || typeof op !== 'object') continue
+      const rawParams = [...pathLevelParams, ...(Array.isArray(op.parameters) ? op.parameters : [])]
+      const resolvedParams: ApiOperationParam[] = rawParams.map((p: any) => {
+        const resolvedParam = p?.$ref ? resolveRef(p.$ref, spec) || p : p
+        return {
+          name: String(resolvedParam?.name || ''),
+          in: String(resolvedParam?.in || 'query'),
+          required: Boolean(resolvedParam?.required),
+          description: resolvedParam?.description,
+          schema: resolveSchema(resolvedParam?.schema || {}, spec),
+        }
+      }).filter(p => p.name)
+
+      const content = op.requestBody?.content || {}
+      const requestContentType = content['application/json']
+        ? 'application/json'
+        : (Object.keys(content)[0] || null)
+      const requestBodySchema = requestContentType ? resolveSchema(content[requestContentType]?.schema || null, spec) : null
+
+      out.push({
+        id: `${method.toUpperCase()} ${path}`,
+        method: method.toUpperCase(),
+        path,
+        summary: op.summary || op.operationId || `${method.toUpperCase()} ${path}`,
+        description: op.description,
+        tags: Array.isArray(op.tags) ? op.tags : [],
+        operationId: op.operationId,
+        parameters: resolvedParams,
+        requestBodySchema,
+        requestBodyRequired: Boolean(op.requestBody?.required),
+        requestContentType,
+        responses: op.responses || {},
+      })
+    }
+  }
+  return out.sort((a, b) => a.path.localeCompare(b.path) || a.method.localeCompare(b.method))
+}
+
+function buildParameterSchema(params: ApiOperationParam[]): Record<string, any> {
+  const properties: Record<string, any> = {}
+  const required: string[] = []
+  for (const p of params) {
+    properties[p.name] = p.schema || { type: 'string' }
+    if (p.required) required.push(p.name)
+  }
+  return { type: 'object', properties, required }
+}
+
+function buildApiInputCompositeSchema(op: ApiOperation | null): Record<string, any> | null {
+  if (!op) return null
+  const pathParams = op.parameters.filter(p => p.in === 'path')
+  const queryParams = op.parameters.filter(p => p.in === 'query')
+  const properties: Record<string, any> = {}
+  const required: string[] = []
+
+  if (pathParams.length) {
+    properties.path_params = buildParameterSchema(pathParams)
+    required.push('path_params')
+  }
+  if (queryParams.length) {
+    properties.query_params = buildParameterSchema(queryParams)
+  }
+  if (op.requestBodySchema && op.requestContentType === 'application/json') {
+    properties.body = op.requestBodySchema
+    if (op.requestBodyRequired) required.push('body')
+  }
+
+  return { type: 'object', properties, required }
+}
+
+function extractResponseContentType(result: any): string | null {
+  const headers = result?.headers
+  if (!headers || typeof headers !== 'object') return null
+  for (const [k, v] of Object.entries(headers)) {
+    if (String(k).toLowerCase() === 'content-type') return String(v)
+  }
+  return null
+}
+
 export function DebugPage(): JSX.Element {
   const [toast, setToast] = useState<{ message: string; kind: 'info' | 'success' | 'warning' | 'error' } | null>(null)
-  const [activeTab, setActiveTab] = useState<'task' | 'unit'>('task')
-  const [unitTestType, setUnitTestType] = useState<'function_harness'>('function_harness')
+  const [activeTab, setActiveTab] = useState<'task' | 'unit' | 'api'>('task')
   const [config, setConfig] = useState<DebugConfig | null>(null)
   const [sessionReady, setSessionReady] = useState(false)
   const [authed, setAuthed] = useState(false)
@@ -118,11 +269,31 @@ export function DebugPage(): JSX.Element {
   const [unitRunning, setUnitRunning] = useState(false)
   const unitInputTouchedRef = useRef(false)
 
+  const [openApiSpec, setOpenApiSpec] = useState<OpenApiSpec | null>(null)
+  const [openApiLoading, setOpenApiLoading] = useState(false)
+  const [openApiError, setOpenApiError] = useState<string | null>(null)
+  const apiOperations = useMemo(() => buildApiOperations(openApiSpec), [openApiSpec])
+  const [selectedApiOpId, setSelectedApiOpId] = useState('')
+  const selectedApiOp = useMemo(
+    () => apiOperations.find(op => op.id === selectedApiOpId) || apiOperations[0] || null,
+    [apiOperations, selectedApiOpId]
+  )
+  const [apiInputMode, setApiInputMode] = useState<'manual' | 'schema' | 'llm'>('manual')
+  const [apiPathParamsText, setApiPathParamsText] = useState('{}')
+  const [apiQueryParamsText, setApiQueryParamsText] = useState('{}')
+  const [apiBodyText, setApiBodyText] = useState('{}')
+  const [apiPlaygroundError, setApiPlaygroundError] = useState<string | null>(null)
+  const [apiRunning, setApiRunning] = useState(false)
+  const [apiGenerateLoading, setApiGenerateLoading] = useState(false)
+  const [apiResult, setApiResult] = useState<any>(null)
+  const [apiInputWarnings, setApiInputWarnings] = useState<string[]>([])
+
   const unitHarness = unitRunResult && typeof unitRunResult === 'object' ? unitRunResult : null
   const unitExecution = unitHarness?.result && typeof unitHarness.result === 'object' ? unitHarness.result : null
   const unitFunctionOutput = unitExecution?.ok ? unitExecution.output : null
   const unitFunctionError = unitExecution?.ok ? null : unitExecution?.error
   const unitValidationWarnings = Array.isArray(unitHarness?.validation_errors) ? unitHarness.validation_errors : []
+  const apiCompositeSchema = useMemo(() => buildApiInputCompositeSchema(selectedApiOp), [selectedApiOp])
 
   useEffect(() => {
     if (!toast) return
@@ -180,6 +351,26 @@ export function DebugPage(): JSX.Element {
   }, [authed])
 
   useEffect(() => {
+    if (!authed) return
+    let cancelled = false
+    ;(async () => {
+      setOpenApiLoading(true)
+      setOpenApiError(null)
+      try {
+        const spec = await fetchOpenApiSpec()
+        if (cancelled) return
+        setOpenApiSpec(spec)
+      } catch (e: any) {
+        if (cancelled) return
+        setOpenApiError(e?.message || 'Failed to load OpenAPI spec')
+      } finally {
+        if (!cancelled) setOpenApiLoading(false)
+      }
+    })()
+    return () => { cancelled = true }
+  }, [authed])
+
+  useEffect(() => {
     if (!selectedRunId || !authed) return
     let stop = false
     const load = async () => {
@@ -213,6 +404,37 @@ export function DebugPage(): JSX.Element {
     if (unitInputTouchedRef.current) return
     setUnitInputText(pretty(selectedUnit.sample_input || {}))
   }, [selectedUnit])
+
+  useEffect(() => {
+    if (!apiOperations.length) return
+    if (!selectedApiOpId || !apiOperations.some(op => op.id === selectedApiOpId)) {
+      setSelectedApiOpId(apiOperations[0].id)
+    }
+  }, [apiOperations, selectedApiOpId])
+
+  useEffect(() => {
+    if (!selectedApiOp) return
+    const pathDefaults: Record<string, any> = {}
+    for (const p of selectedApiOp.parameters.filter(p => p.in === 'path')) {
+      pathDefaults[p.name] = p.schema?.example ?? (p.schema?.type === 'integer' ? 1 : 'test')
+    }
+    const queryDefaults: Record<string, any> = {}
+    for (const p of selectedApiOp.parameters.filter(p => p.in === 'query')) {
+      if (p.required) {
+        queryDefaults[p.name] = p.schema?.example ?? (p.schema?.type === 'integer' ? 1 : 'test')
+      }
+    }
+    setApiPathParamsText(pretty(pathDefaults))
+    setApiQueryParamsText(pretty(queryDefaults))
+    if (selectedApiOp.requestContentType === 'application/json' && selectedApiOp.requestBodySchema) {
+      setApiBodyText(pretty({}))
+    } else {
+      setApiBodyText('')
+    }
+    setApiResult(null)
+    setApiInputWarnings([])
+    setApiPlaygroundError(null)
+  }, [selectedApiOp?.id])
 
   const onLogin = async () => {
     setAuthError(null)
@@ -334,6 +556,123 @@ export function DebugPage(): JSX.Element {
     }
   }
 
+  const onGenerateApiInput = async (mode: 'schema' | 'llm') => {
+    if (!selectedApiOp || !apiCompositeSchema) return
+    setApiPlaygroundError(null)
+    setApiGenerateLoading(true)
+    setApiInputMode(mode)
+    try {
+      const generated = await generateDebugApiPlaygroundInput({
+        mode,
+        schema: apiCompositeSchema,
+        method: selectedApiOp.method,
+        path: selectedApiOp.path,
+        summary: selectedApiOp.summary,
+      })
+      const inputData = generated.input_data || {}
+      setApiPathParamsText(pretty(inputData.path_params || {}))
+      setApiQueryParamsText(pretty(inputData.query_params || {}))
+      if (selectedApiOp.requestContentType === 'application/json' && selectedApiOp.requestBodySchema) {
+        setApiBodyText(pretty(inputData.body ?? {}))
+      }
+      setApiInputWarnings(Array.isArray(generated.validation_errors) ? generated.validation_errors : [])
+      setApiInputMode(mode)
+    } catch (e: any) {
+      setApiPlaygroundError(e?.message || 'Failed to generate API input')
+    } finally {
+      setApiGenerateLoading(false)
+    }
+  }
+
+  const onRunApi = async () => {
+    if (!selectedApiOp) return
+    setApiPlaygroundError(null)
+    setApiResult(null)
+    setApiRunning(true)
+    try {
+      const pathParams = apiPathParamsText.trim() ? JSON.parse(apiPathParamsText) : {}
+      const queryParams = apiQueryParamsText.trim() ? JSON.parse(apiQueryParamsText) : {}
+      const hasJsonBody = selectedApiOp.requestContentType === 'application/json' && selectedApiOp.requestBodySchema
+      const bodyObj = hasJsonBody && apiBodyText.trim() ? JSON.parse(apiBodyText) : undefined
+
+      if (pathParams && typeof pathParams !== 'object') throw new Error('Path Params must be a JSON object')
+      if (queryParams && typeof queryParams !== 'object') throw new Error('Query Params must be a JSON object')
+      let resolvedPath = selectedApiOp.path
+      for (const p of selectedApiOp.parameters.filter(p => p.in === 'path')) {
+        if (!(p.name in pathParams)) {
+          throw new Error(`Missing required path param: ${p.name}`)
+        }
+        resolvedPath = resolvedPath.replace(new RegExp(`\\{${p.name}\\}`, 'g'), encodeURIComponent(String((pathParams as any)[p.name])))
+      }
+
+      const query = new URLSearchParams()
+      for (const [k, v] of Object.entries(queryParams || {})) {
+        if (v === undefined || v === null || v === '') continue
+        if (Array.isArray(v)) {
+          v.forEach(item => query.append(k, String(item)))
+        } else {
+          query.set(k, String(v))
+        }
+      }
+
+      const url = `${DEBUG_BASE_URL}${resolvedPath}${query.toString() ? `?${query.toString()}` : ''}`
+      const headers: Record<string, string> = {}
+      let body: string | undefined
+      if (hasJsonBody) {
+        headers['Content-Type'] = 'application/json'
+        body = JSON.stringify(bodyObj ?? {})
+      }
+
+      const started = performance.now()
+      const res = await fetch(url, {
+        method: selectedApiOp.method,
+        credentials: 'include',
+        headers,
+        body,
+      })
+      const durationMs = Math.round(performance.now() - started)
+      const text = await res.text().catch(() => '')
+      let parsed: any = null
+      let isJson = false
+      try {
+        parsed = text ? JSON.parse(text) : null
+        isJson = true
+      } catch {
+        parsed = text
+      }
+
+      const headerObj: Record<string, string> = {}
+      res.headers.forEach((value, key) => { headerObj[key] = value })
+
+      setApiResult({
+        ok: res.ok,
+        request: {
+          method: selectedApiOp.method,
+          path_template: selectedApiOp.path,
+          resolved_path: resolvedPath,
+          query_params: queryParams,
+          path_params: pathParams,
+          body: hasJsonBody ? (bodyObj ?? {}) : undefined,
+          input_mode: apiInputMode,
+        },
+        response: {
+          status: res.status,
+          status_text: res.statusText,
+          headers: headerObj,
+          content_type: res.headers.get('content-type'),
+          is_json: isJson,
+          body: parsed,
+          raw_text: text,
+        },
+        duration_ms: durationMs,
+      })
+    } catch (e: any) {
+      setApiPlaygroundError(e?.message || 'Failed to run API request')
+    } finally {
+      setApiRunning(false)
+    }
+  }
+
   const isBehaviorRunning = behaviorActionLoading !== null || Boolean(selectedRun?.job_running)
 
   if (!sessionReady) {
@@ -344,8 +683,11 @@ export function DebugPage(): JSX.Element {
     return (
       <div className="debug-page">
         <div className="debug-panel">
-          <h1>Internal Debug</h1>
-          <p>Debug UI is disabled (`DEBUG_UI_ENABLED=false`).</p>
+          <h1>Debugging Page</h1>
+          <br />
+          <p>Debug UI is disabled..! </p>
+          <p>If you are an admin, please enable it from the backend configuration. If not, please contact Admin for details.</p>
+          <br />
           <Link to="/MetaRec">Back to MetaRec</Link>
         </div>
       </div>
@@ -410,6 +752,14 @@ export function DebugPage(): JSX.Element {
               onClick={() => setActiveTab('unit')}
             >
               Unit Test Bench
+            </button>
+            <button
+              role="tab"
+              aria-selected={activeTab === 'api'}
+              className={`debug-tab ${activeTab === 'api' ? 'active' : ''}`}
+              onClick={() => setActiveTab('api')}
+            >
+              API Playground
             </button>
           </div>
 
@@ -538,7 +888,7 @@ export function DebugPage(): JSX.Element {
                 )}
               </section>
             </div>
-          ) : (
+          ) : activeTab === 'unit' ? (
             <section className="debug-panel debug-panel-wide debug-panel-full-span debug-tab-panel" role="tabpanel" aria-label="Unit Test Bench">
               <div className="debug-panel-title-row">
                 <h2>Unit Test Bench</h2>
@@ -546,18 +896,7 @@ export function DebugPage(): JSX.Element {
                   <button className="debug-secondary" onClick={() => refreshUnits()}>Refresh Units</button>
                 </div>
               </div>
-
-              <div className="debug-unit-toolbar">
-                <div className="debug-unit-toolbar-group">
-                  <label>Test Type</label>
-                  <select value={unitTestType} onChange={(e) => setUnitTestType(e.target.value as 'function_harness')}>
-                    <option value="function_harness">Function Harness</option>
-                  </select>
-                </div>
-              </div>
-
-              {unitTestType === 'function_harness' && (
-                <div className="debug-unit-layout">
+              <div className="debug-unit-layout">
                   <div className="debug-unit-left">
                     <label>Registered Units</label>
                     <select
@@ -724,7 +1063,255 @@ export function DebugPage(): JSX.Element {
                     </div>
                   </div>
                 </div>
-              )}
+            </section>
+          ) : (
+            <section className="debug-panel debug-panel-wide debug-panel-full-span debug-tab-panel" role="tabpanel" aria-label="API Playground">
+              <div className="debug-panel-title-row">
+                <h2>API Playground</h2>
+                <div className="debug-row">
+                  <button className="debug-secondary" onClick={() => {
+                    setOpenApiLoading(true)
+                    setOpenApiError(null)
+                    fetchOpenApiSpec()
+                      .then(spec => setOpenApiSpec(spec))
+                      .catch((e: any) => setOpenApiError(e?.message || 'Failed to load OpenAPI spec'))
+                      .finally(() => setOpenApiLoading(false))
+                  }}>
+                    Refresh OpenAPI
+                  </button>
+                </div>
+              </div>
+
+              <div className="debug-api-layout">
+                <div className="debug-api-left">
+                  <div className="debug-api-catalog-header">
+                    <div>
+                      <label>Registered APIs (from `/openapi.json`)</label>
+                      <div className="debug-muted">
+                        {openApiLoading ? 'Loading OpenAPI spec...' : `${apiOperations.length} endpoints`}
+                      </div>
+                    </div>
+                  </div>
+                  {openApiError && <div className="debug-error">{openApiError}</div>}
+                  <div className="debug-api-list">
+                    {apiOperations.map(op => (
+                      <button
+                        key={op.id}
+                        className={`debug-api-item ${selectedApiOp?.id === op.id ? 'active' : ''}`}
+                        onClick={() => setSelectedApiOpId(op.id)}
+                      >
+                        <div className="debug-api-item-top">
+                          <span className={`debug-method-badge ${op.method.toLowerCase()}`}>{op.method}</span>
+                          <span className="debug-api-path">{op.path}</span>
+                        </div>
+                        <div className="debug-api-summary">{op.summary}</div>
+                        <div className="debug-api-item-meta">
+                          <span>{op.parameters.length} params</span>
+                          <span>{op.requestBodySchema ? (op.requestContentType || 'body') : 'no body'}</span>
+                        </div>
+                      </button>
+                    ))}
+                    {!openApiLoading && !apiOperations.length && !openApiError && (
+                      <div className="debug-muted">No endpoints found in OpenAPI spec.</div>
+                    )}
+                  </div>
+                </div>
+
+                <div className="debug-api-right">
+                  {!selectedApiOp ? (
+                    <div className="debug-muted">Select an API endpoint to inspect and test.</div>
+                  ) : (
+                    <div className="debug-rendered-output">
+                      <div className="debug-result-grid">
+                        <div className="debug-result-card">
+                          <div className="debug-result-card-title">Method</div>
+                          <div className="debug-result-card-value">
+                            <span className={`debug-method-badge ${selectedApiOp.method.toLowerCase()}`}>{selectedApiOp.method}</span>
+                          </div>
+                          <div className="debug-result-card-meta">{selectedApiOp.path}</div>
+                        </div>
+                        <div className="debug-result-card">
+                          <div className="debug-result-card-title">Operation</div>
+                          <div className="debug-result-card-value">{selectedApiOp.operationId || '-'}</div>
+                          <div className="debug-result-card-meta">{selectedApiOp.tags.join(', ') || 'No tags'}</div>
+                        </div>
+                        <div className="debug-result-card">
+                          <div className="debug-result-card-title">Path Params</div>
+                          <div className="debug-result-card-value">{selectedApiOp.parameters.filter(p => p.in === 'path').length}</div>
+                          <div className="debug-result-card-meta">Required URL placeholders</div>
+                        </div>
+                        <div className="debug-result-card">
+                          <div className="debug-result-card-title">Body Schema</div>
+                          <div className="debug-result-card-value">{selectedApiOp.requestBodySchema ? 'Yes' : 'No'}</div>
+                          <div className="debug-result-card-meta">{selectedApiOp.requestContentType || 'No request body'}</div>
+                        </div>
+                      </div>
+
+                      <div className="debug-result-section">
+                        <div className="debug-result-section-title">Endpoint Info</div>
+                        <div className="debug-result-keyvals">
+                          <div><span>Summary</span><strong>{selectedApiOp.summary}</strong></div>
+                          <div><span>Description</span><strong>{selectedApiOp.description || '-'}</strong></div>
+                          <div><span>Tags</span><strong>{selectedApiOp.tags.join(', ') || '-'}</strong></div>
+                          <div><span>Responses</span><strong>{Object.keys(selectedApiOp.responses || {}).join(', ') || '-'}</strong></div>
+                        </div>
+                      </div>
+
+                      {selectedApiOp.parameters.length > 0 && (
+                        <div className="debug-result-section">
+                          <div className="debug-result-section-title">Parameters (structured)</div>
+                          <div className="debug-result-structured">
+                            {renderStructuredValue(
+                              selectedApiOp.parameters.map(p => ({
+                                name: p.name,
+                                in: p.in,
+                                required: p.required,
+                                description: p.description,
+                                schema: p.schema,
+                              }))
+                            )}
+                          </div>
+                        </div>
+                      )}
+
+                      {selectedApiOp.requestBodySchema && (
+                        <details className="debug-result-section" open>
+                          <summary>Request Body Schema (`{selectedApiOp.requestContentType || 'unknown'}`)</summary>
+                          <div className="debug-result-structured">
+                            {renderStructuredValue(selectedApiOp.requestBodySchema)}
+                          </div>
+                        </details>
+                      )}
+
+                      <div className="debug-result-section">
+                        <div className="debug-result-section-title">Test Input</div>
+                        <div className="debug-api-actions">
+                          <button className="debug-secondary" onClick={() => onGenerateApiInput('schema')} disabled={!apiCompositeSchema || apiGenerateLoading}>
+                            {apiGenerateLoading && apiInputMode === 'schema'
+                              ? <span className="debug-btn-content"><span className="debug-spinner" /> Generating...</span>
+                              : 'Schema Generate'}
+                          </button>
+                          <button className="debug-secondary" onClick={() => onGenerateApiInput('llm')} disabled={!apiCompositeSchema || apiGenerateLoading}>
+                            {apiGenerateLoading && apiInputMode === 'llm'
+                              ? <span className="debug-btn-content"><span className="debug-spinner" /> LLM Generating...</span>
+                              : 'LLM Generate'}
+                          </button>
+                          <button onClick={onRunApi} disabled={apiRunning}>
+                            {apiRunning
+                              ? <span className="debug-btn-content"><span className="debug-spinner" /> Running API...</span>
+                              : 'Run API'}
+                          </button>
+                        </div>
+
+                        {apiInputWarnings.length > 0 && (
+                          <div className="debug-result-section warning">
+                            <div className="debug-result-section-title">Generated Input Warnings</div>
+                            <ul className="debug-result-list">
+                              {apiInputWarnings.map((w, i) => <li key={`${w}-${i}`}>{w}</li>)}
+                            </ul>
+                          </div>
+                        )}
+                        {apiPlaygroundError && <div className="debug-error">{apiPlaygroundError}</div>}
+
+                        <div className="debug-api-editor-grid">
+                          <div>
+                            <label>Path Params JSON</label>
+                            <textarea rows={6} value={apiPathParamsText} onChange={(e) => { setApiInputMode('manual'); setApiPathParamsText(e.target.value) }} />
+                          </div>
+                          <div>
+                            <label>Query Params JSON</label>
+                            <textarea rows={6} value={apiQueryParamsText} onChange={(e) => { setApiInputMode('manual'); setApiQueryParamsText(e.target.value) }} />
+                          </div>
+                        </div>
+                        {selectedApiOp.requestContentType === 'application/json' && selectedApiOp.requestBodySchema ? (
+                          <>
+                            <label>Request Body JSON</label>
+                            <textarea rows={12} value={apiBodyText} onChange={(e) => { setApiInputMode('manual'); setApiBodyText(e.target.value) }} />
+                          </>
+                        ) : selectedApiOp.requestBodySchema ? (
+                          <div className="debug-error">
+                            Request body content type `{selectedApiOp.requestContentType}` is not yet supported by the API Playground runner (JSON only).
+                          </div>
+                        ) : null}
+                      </div>
+
+                      <div className={`debug-unit-result ${apiRunning ? 'is-running' : ''}`}>
+                        <h3>API Output</h3>
+                        <div className="debug-output-shell">
+                          {apiRunning && (
+                            <div className="debug-output-overlay" aria-live="polite">
+                              <span className="debug-spinner" />
+                              <span>Executing API request...</span>
+                            </div>
+                          )}
+                          {!apiResult ? (
+                            <pre>{'No API run yet.'}</pre>
+                          ) : (
+                            <div className="debug-rendered-output">
+                              <div className="debug-result-grid">
+                                <div className="debug-result-card">
+                                  <div className="debug-result-card-title">HTTP Status</div>
+                                  <div className="debug-result-card-value">
+                                    <span className={`debug-status ${apiResult.ok ? 'completed' : 'error'}`}>
+                                      {apiResult.response?.status} {apiResult.response?.status_text}
+                                    </span>
+                                  </div>
+                                  <div className="debug-result-card-meta">{apiResult.ok ? 'Request succeeded' : 'Request failed'}</div>
+                                </div>
+                                <div className="debug-result-card">
+                                  <div className="debug-result-card-title">Latency</div>
+                                  <div className="debug-result-card-value">{formatMs(apiResult.duration_ms)}</div>
+                                  <div className="debug-result-card-meta">Measured in browser</div>
+                                </div>
+                                <div className="debug-result-card">
+                                  <div className="debug-result-card-title">Content Type</div>
+                                  <div className="debug-result-card-value">{extractResponseContentType(apiResult.response) || '-'}</div>
+                                  <div className="debug-result-card-meta">Response header</div>
+                                </div>
+                                <div className="debug-result-card">
+                                  <div className="debug-result-card-title">Resolved Path</div>
+                                  <div className="debug-result-card-value">{apiResult.request?.resolved_path || selectedApiOp.path}</div>
+                                  <div className="debug-result-card-meta">{apiResult.request?.method}</div>
+                                </div>
+                              </div>
+
+                              <div className="debug-result-section">
+                                <div className="debug-result-section-title">Request Summary (structured)</div>
+                                <div className="debug-result-structured">
+                                  {renderStructuredValue(apiResult.request || {})}
+                                </div>
+                              </div>
+
+                              <div className="debug-result-section">
+                                <div className="debug-result-section-title">Response Summary (structured)</div>
+                                <div className="debug-result-structured">
+                                  {renderStructuredValue({
+                                    status: apiResult.response?.status,
+                                    status_text: apiResult.response?.status_text,
+                                    content_type: apiResult.response?.content_type,
+                                    is_json: apiResult.response?.is_json,
+                                    body: apiResult.response?.body,
+                                  })}
+                                </div>
+                              </div>
+
+                              <details className="debug-result-section">
+                                <summary>Response Headers</summary>
+                                <pre>{pretty(apiResult.response?.headers || {})}</pre>
+                              </details>
+
+                              <div className="debug-result-section">
+                                <div className="debug-result-section-title">Raw API Response (pretty JSON/text)</div>
+                                <pre>{apiResult.response?.is_json ? pretty(apiResult.response?.body) : String(apiResult.response?.raw_text || '')}</pre>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
             </section>
           )}
         </>

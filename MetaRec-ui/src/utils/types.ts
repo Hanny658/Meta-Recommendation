@@ -165,3 +165,4 @@ export type DebugUnitSpec = {
   sample_input: Record<string, any>
 }
 
+export type OpenApiSpec = Record<string, any>

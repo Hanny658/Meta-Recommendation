@@ -267,6 +267,14 @@ class UnitInputGenerateRequest(BaseModel):
     mode: str = "schema"  # schema | sample | llm
 
 
+class ApiPlaygroundInputGenerateRequest(BaseModel):
+    mode: str = "schema"  # schema | llm
+    schema: Dict[str, Any]
+    method: Optional[str] = None
+    path: Optional[str] = None
+    summary: Optional[str] = None
+
+
 class UnitRegistry:
     def __init__(self, service_getter: Callable[[], Any]):
         self._service_getter = service_getter
@@ -371,11 +379,21 @@ def _generate_from_schema(schema: Dict[str, Any]) -> Any:
 
 
 async def _generate_llm_input(unit_spec: UnitSpec) -> Optional[Dict[str, Any]]:
+    return await _generate_llm_json_from_schema(
+        unit_spec.input_schema,
+        context_hint="Restaurant recommender debug unit test input",
+    )
+
+
+async def _generate_llm_json_from_schema(schema: Dict[str, Any], context_hint: str = "") -> Optional[Dict[str, Any]]:
     if debug_llm_client is None or not DEBUG_LLM_MODEL:
         return None
+    context_line = f"Context: {context_hint}\n" if context_hint else ""
     prompt = (
-        "Generate one JSON object satisfying the schema with some dummy meaningful data to test this Restaurant Recommender System.\n"
-        f"{json.dumps(unit_spec.input_schema, ensure_ascii=False)}"
+        "Generate one JSON object that strictly satisfies the JSON schema.\n"
+        "Use realistic but dummy values. Prefer compact payloads.\n"
+        f"{context_line}"
+        f"{json.dumps(schema, ensure_ascii=False)}"
     )
     try:
         resp = await debug_llm_client.chat.completions.create(
@@ -399,6 +417,15 @@ async def _generate_unit_input(spec: UnitSpec, mode: str) -> Dict[str, Any]:
         if generated is not None:
             return generated
     return _generate_from_schema(spec.input_schema)
+
+
+async def _generate_api_playground_input(payload: ApiPlaygroundInputGenerateRequest) -> Dict[str, Any]:
+    if payload.mode == "llm":
+        hint_parts = [p for p in [payload.method, payload.path, payload.summary] if p]
+        generated = await _generate_llm_json_from_schema(payload.schema, context_hint="API Playground " + " ".join(hint_parts))
+        if generated is not None:
+            return generated
+    return _generate_from_schema(payload.schema)
 
 
 def _debug_user(user_id: str, run_id: str) -> str:
@@ -784,6 +811,18 @@ def create_debug_router(service_getter: Callable[[], Any]) -> APIRouter:
             "input_data": _sanitize(input_data),
             "validation_errors": _validate_schema(input_data, spec.input_schema),
             "result": await unit_registry.run(spec.name, input_data),
+        }
+
+    @router.post("/api-playground/generate-input")
+    async def generate_api_playground_input(payload: ApiPlaygroundInputGenerateRequest, _: Dict[str, Any] = Depends(require_auth)):
+        if payload.mode not in {"schema", "llm"}:
+            raise HTTPException(status_code=400, detail="mode must be 'schema' or 'llm'")
+        generated = await _generate_api_playground_input(payload)
+        return {
+            "ok": True,
+            "mode": payload.mode,
+            "input_data": _sanitize(generated),
+            "validation_errors": _validate_schema(generated, payload.schema),
         }
 
     return router
