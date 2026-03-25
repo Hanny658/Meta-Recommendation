@@ -37,7 +37,7 @@ SYSTEM_PROMPT = (
     "   同分优先级: 更高评分且评论量更大者; 其次交通更便捷者; 再次多样性 (覆盖不同子品类)。\n"
     "5) 解释与不确定性: 为每条结果提供 1–2 句“为什么匹配”的可验证理由; 若信息缺失 (如价位不明), 明确指出并给出依据。\n\n"
     "[输出格式 (必须严格遵守, 仅输出 JSON, 不要额外文字)]\n"
-    "{\n  \"recommendations\": [\n    {\n      \"name\": \"...\",\n      \"address\": \"...\",\n      \"area\": \"...\",\n      \"cuisine\": \"Sichuan/Hotpot/BBQ/...\",\n      \"type\": \"casual/fine dining/...\",\n      \"price_per_person_sgd\": \"30-50\",\n      \"rating\": 4.6,\n      \"reviews_count\": 1234,\n      \"open_hours_note\": \"Open late Fri\",\n      \"flavor_match\": [\"Spicy\", \"Umami\"],\n      \"purpose_match\": [\"Friends\", \"Group-friendly\"],\n      \"why\": \"基于评分与评论量、重辣口味与朋友聚会标签, 且人均落在预算内。\",\n      \"sources\": {\n        \"google_maps\": \"<URL or place_id or snippet>\",\n        \"xiaohongshu\": \"<note ids or summary if any>\"\n      }\n    }\n  ]\n}\n"
+    "{\n  \"recommendations\": [\n    {\n      \"name\": \"...\",\n      \"address\": \"...\",\n      \"area\": \"...\",\n      \"cuisine\": \"Sichuan/Hotpot/BBQ/...\",\n      \"type\": \"casual/fine dining/...\",\n      \"price_per_person_sgd\": \"30-50\",\n      \"rating\": 4.6,\n      \"reviews_count\": 1234,\n      \"open_hours_note\": \"Open late Fri\",\n      \"flavor_match\": [\"Spicy\", \"Umami\"],\n      \"purpose_match\": [\"Friends\", \"Group-friendly\"],\n      \"why\": \"基于评分与评论量、重辣口味与朋友聚会标签, 且人均落在预算内。\",\n      \"sources\": {\n        \"google_maps\": \"<URL or place_id or snippet>\",\n        \"xiaohongshu\": \"<note ids or summary if any>\"\n      ,\"yelp\": \"<URL or place_id or snippet>\"}\n    }\n  ]\n}\n"
     "- 始终返回正好 5 条 (不足则返回现有并在 why 中说明样本不足)。\n"
     "- 字段缺失用 null 或省略, 不可捏造。\n"
     "- 绝不输出除 JSON 以外的任何文本。"
@@ -49,6 +49,7 @@ def summarize_recommendations(
     user_input: Union[str, Dict[str, Any]],
     gmap_search_results: Any,
     xhs_search_results: Any,
+    yelp_search_results: Any,
     # temperature: float = 0.2,
     model: str = DEPLOYMENT_NAME,
 ):
@@ -69,10 +70,11 @@ def summarize_recommendations(
 
     gmap_str = safe_dump(gmap_search_results)
     xhs_str = safe_dump(xhs_search_results)
+    yelp_str = safe_dump(yelp_search_results)
 
     user_message = (
         f"【用户偏好输入】为 {user_input_str}\n\n"
-        f"【工具检索结果】{{\n  \"gmap.search\": {gmap_str}, \"xhs.search\": {xhs_str}}}"
+        f"【工具检索结果】{{\n  \"gmap.search\": {gmap_str}, \"xhs.search\": {xhs_str}, \"yelp.search\": {yelp_str}}}"
     )
 
     completion = client.chat.completions.create(
@@ -152,11 +154,14 @@ if __name__ == "__main__":
         # 从 executions 中抽取各工具结果
         gmap_results = None
         xhs_results = None
+        yelp_results = None
         for item in executions:
             if item.get("tool") == "gmap.search":
                 gmap_results = item.get("output")
             if item.get("tool") == "xhs.search":
                 xhs_results = item.get("output")
+            if item.get("tool") == "yelp.search":
+                yelp_results = item.get("output")
         # 读取 user_input（由 demo_begin.py 保存）
         user_input = data.get("user_input")
         if not user_input:
@@ -175,9 +180,10 @@ if __name__ == "__main__":
         }
         gmap_results = []
         xhs_results = []
+        yelp_results = []
 
     logger.info("summarizing recommendations...")
-    resp = summarize_recommendations(client, user_input, gmap_results, xhs_results)
+    resp = summarize_recommendations(client, user_input, gmap_results, xhs_results, yelp_results)
     content = resp.choices[0].message.content
     logger.info("summary generated (%d chars)", len(content) if content else 0)
     logger.info("summary output:\n%s", content if content else "<empty>")
@@ -187,6 +193,7 @@ if __name__ == "__main__":
         "user_input": user_input,
         "gmap_results": gmap_results,
         "xhs_results": xhs_results,
+        "yelp_results": yelp_results,
         "summary": None
     }
     try:

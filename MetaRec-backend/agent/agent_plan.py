@@ -12,10 +12,11 @@ DEPLOYMENT_NAME = "gpt-4.1"
 
 SYSTEM_PROMPT = (
     "你是一个擅长用户意图识别和工具规划的agent。输入可能是结构化字段或自然语言描述。"
-    "你的唯一输出是: 为后续检索需要调用哪些工具 (小红书, Google Maps) 以及每次调用的 query 参数, 且仅以规定的形式输出。\n\n"
+    "你的唯一输出是: 为后续检索需要调用哪些工具 (小红书, Google Maps, Yelp) 以及每次调用的 query 参数, 且仅以规定的形式输出。\n\n"
     "[可用工具]\n"
     "1) xhs.search (小红书): 获取口碑/探店/氛围/口味线索。参数: query:string。\n"
     "2) gmap.search (Google Maps): 获取候选门店列表, 评分, 价格区间, 评论, 营业时间等。参数: query:string。\n\n"
+    "3) yelp.search (Yelp): 获取候选门店列表, 评分, 价格区间, 评论, 营业时间等。参数: query:string。\n\n"
     "[用户输入解析]\n"
     "可能包含:\n"
     "- <restaurant_type>: 例如{casual, fine dining, fast casual, street food, buffet, cafe}\n"
@@ -26,11 +27,12 @@ SYSTEM_PROMPT = (
     "- <food_type>: 例如 Hotpot, BBQ, Seafood, Dim Sum\n\n"
     "[输出要求]\n"
     "- 仅按照[输出格式示例]的形式输出所选工具与参数, 不要返回除工具调用外的任何文字或解释。\n"
-    "- 若 <restaurant_type> 或 <food_type> 含多项, 可分别为每一项各调用一次 gmap.search 与 xhs.search。\n"
+    "- 若 <restaurant_type> 或 <food_type> 含多项, 可分别为每一项各调用一次 gmap.search, yelp.search 与 xhs.search。\n"
     "- 若信息不足, 基于已有字段做最合理的关键词组合; 不要向用户追问。\n\n"
     "[输出格式示例]\n"
     "[\n"
     "  {\"function_name\": \"gmap.search\", \"parameters\": {\"query\": \"Chinatown Hotpot buffet\"}},\n"
+    "  {\"function_name\": \"yelp.search\", \"parameters\": {\"query\": \"Hotpot buffet\"}},\n"
     "  {\"function_name\": \"xhs.search\", \"parameters\": {\"query\": \"新加坡 Chinatown 川菜 辣 朋友聚餐 人均 20-60\"}}\n"
     "]\n"
 )
@@ -53,6 +55,28 @@ TOOLS = [
                 "additionalProperties": False
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "yelp.search",
+            "description": "在 Yelp 中搜索餐厅候选, 返回门店列表、评分、价格区间、评论、营业时间等。",
+            "parameters": {
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "搜索关键词，严格遵守<food_type><restaurant_type>，如：\"Hotpot buffet\"。"
+                        # for now, location set is set simply to "Singapore" by default, see `agent_yelp.py`
+                    },
+                },
+                "required": [
+                    "query",
+                ],
+                "additionalProperties": False,
+            },
+        },
     },
     {
         "type": "function",
