@@ -9,6 +9,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 from datetime import datetime
+from client import create_async_client, create_sync_azure_client, create_sync_client, create_async_azure_client
 import os
 import json
 import logging
@@ -55,9 +56,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# create OpenAI clients
+async_client = create_async_client()
+
+try:
+    sync_client = create_sync_azure_client()
+except Exception as e:
+    sync_client = create_sync_client()
+
 # ==================== 创建服务实例 ====================
 # 这是全局服务实例，可以被所有路由使用
-metarec_service = MetaRecService()
+metarec_service = MetaRecService(async_client, sync_client)
 
 # ==================== Conversation Preferences 内存缓存 ====================
 # 存储格式: {f"{user_id}:{conversation_id}": preferences_dict}
