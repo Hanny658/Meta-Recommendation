@@ -62,7 +62,6 @@ TOOLS = [
             "name": "yelp.search",
             "description": "在 Yelp 中搜索餐厅候选, 返回门店列表、评分、价格区间、评论、营业时间等。",
             "parameters": {
-            "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
