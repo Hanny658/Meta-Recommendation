@@ -372,7 +372,7 @@ async def analyze_user_message(
 
 
 async def generate_confirmation_message(
-    client: Union[AsyncOpenAi, AsyncAzureOpenAI],
+    client: Union[AsyncOpenAI, AsyncAzureOpenAI],
     query: str,
     preferences: Dict[str, Any],
     language: str = "en",
@@ -560,7 +560,7 @@ Generate natural friendly confirmation message(2-3 sentences): no list format, n
 
 
 async def generate_missing_preferences_guidance(
-    client: Union[AsyncOpenAi, AsyncAzureOpenAI],
+    client: Union[AsyncOpenAI, AsyncAzureOpenAI],
     preferences: Dict[str, Any],
     language: str = "en",
     user_profile: Optional[Dict[str, Any]] = None
@@ -633,7 +633,7 @@ Generate natural friendly guidance message(2-3 sentences): no list format, natur
 
 
 async def stream_llm_response(
-    client: Union[AsyncOpenAi, AsyncAzureOpenAI],
+    client: Union[AsyncOpenAI, AsyncAzureOpenAI],
     message: str,
     conversation_history: Optional[list] = None
 ) -> AsyncIterator[str]:
