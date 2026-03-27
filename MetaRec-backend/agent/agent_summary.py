@@ -11,7 +11,7 @@ import logging
 from datetime import datetime
 
 # Azure OpenAI 配置
-deployment_name = "o4-mini"  # Azure 部署名称
+DEPLOYMENT_NAME = "o4-mini"  # Azure 部署名称
 
 # 从环境变量读取配置
 
@@ -50,6 +50,7 @@ def summarize_recommendations(
     gmap_search_results: Any,
     xhs_search_results: Any,
     # temperature: float = 0.2,
+    model: str = DEPLOYMENT_NAME,
 ):
     if not isinstance(user_input, str):
         try:
@@ -75,7 +76,7 @@ def summarize_recommendations(
     )
 
     completion = client.chat.completions.create(
-        model=deployment_name,
+        model=model,
         temperature=1,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},

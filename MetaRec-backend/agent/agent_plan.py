@@ -5,9 +5,7 @@ from dotenv import load_dotenv
 from typing import Union
 
 # 加载 .env 文件
-
-# Azure OpenAI 配置
-deployment_name = "gpt-4.1"
+DEPLOYMENT_NAME = "gpt-4.1"
 
 # 从环境变量读取 API Key
 
@@ -78,7 +76,8 @@ TOOLS = [
 
 def run_demo(
         client: Union[AzureOpenAI, OpenAI],
-        user_input: str
+        user_input: str,
+        model: str = DEPLOYMENT_NAME, # default
     ):
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -86,7 +85,7 @@ def run_demo(
     ]
 
     completion = client.chat.completions.create(
-        model=deployment_name,
+        model=model,
         temperature=0.2,
         messages=messages,
         tools=TOOLS,
@@ -124,7 +123,7 @@ if __name__ == "__main__":
         azure_endpoint=azure_endpoint,
     )
 
-    resp = run_demo(client, example_input)
+    resp = run_demo(client, example_input, DEPLOYMENT_NAME)
     # 打印第一条消息以便查看是否产生 function call
     first_choice = resp.choices[0].message
     print(first_choice)

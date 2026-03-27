@@ -94,15 +94,22 @@ class MetaRecService:
             self, 
             async_client: Union[AsyncOpenAI, AsyncAzureOpenAI],
             sync_client: Union[OpenAI, AzureOpenAI],
+            summary_model: str,
+            planning_model: str,
+            llm_model: str,
             restaurant_data: Optional[List[Dict]] = None,
         ):
         """
         初始化服务
         
         Args:
-            restaurant_data: 餐厅数据列表，如果为None则使用默认样例数据
             async_client: async openai client
             sync_client: sync openai client
+            summary_model: model name for summary task
+            planning_model: model name for planning task
+            llm_model: model name for other task
+
+            restaurant_data: 餐厅数据列表，如果为None则使用默认样例数据
         """
         # 餐厅数据库
         self.restaurant_data = restaurant_data or self._get_default_restaurants()
@@ -117,6 +124,10 @@ class MetaRecService:
         
         self.async_client = async_client
         self.sync_client = sync_client
+        
+        self.summary_model = summary_model
+        self.planning_model = planning_model
+        self.llm_model = llm_model
     
     def _get_session_key(self, user_id: str, session_id: Optional[str] = None) -> str:
         """
@@ -810,7 +821,15 @@ class MetaRecService:
                 
                 # 生成确认消息
                 message = await generate_confirmation_message(
-                    self.async_client, query, preferences, language, user_profile, guide_missing_preferences)
+                    self.async_client, 
+                    self.llm_model, 
+                    query, 
+                    preferences, 
+                    language, 
+                    user_profile, 
+                    guide_missing_preferences,
+                    model=self.llm_model,
+                )
             except Exception as e:
                 print(f"Error generating LLM confirmation message, falling back to template: {e}")
                 # 回退到模板格式
@@ -1141,7 +1160,7 @@ class MetaRecService:
             executions = []
             summary_content = None
             
-            async for status_update in execute_agent_pipeline(self.sync_client, user_input, use_online=use_online_agent):
+            async for status_update in execute_agent_pipeline(self.sync_client, self.summary_model, self.planning_model, user_input, use_online=use_online_agent):
                 # 更新任务状态
                 stage = status_update.get("stage", "")
                 stage_number = status_update.get("stage_number", 0)
@@ -1563,7 +1582,8 @@ class MetaRecService:
                 enhanced_history,  # 使用增强后的对话历史
                 user_profile,
                 is_in_query_flow=is_in_query_flow,
-                pending_preferences=pending_preferences
+                pending_preferences=pending_preferences,
+                model=self.llm_model,
             )
             
             # Step 2.5: 更新用户画像（如果有新的画像信息）
@@ -1730,7 +1750,8 @@ class MetaRecService:
                                     self.async_client,
                                     current_preferences,
                                     language,
-                                    user_profile_for_guidance
+                                    user_profile_for_guidance,
+                                    model=self.llm_model,
                                 )
                                 
                                 # 更新上下文中的确认消息
@@ -2274,6 +2295,9 @@ class MetaRecService:
 def create_service(
         async_client: Union[AsyncOpenAI, AsyncAzureOpenAI],
         sync_client: Union[OpenAI, AzureOpenAI],
+        summary_model: str,
+        planning_model: str,
+        llm_model: str,
         restaurant_data: Optional[List[Dict]] = None,
     ) -> MetaRecService:
     """
@@ -2282,6 +2306,10 @@ def create_service(
     Args:
         async_client: async openai client
         sync_client: sync openai client
+        summary_model: model name for summary task
+        planning_model: model name for planning task
+        llm_model: model name for other task
+
         restaurant_data: 可选的餐厅数据
 
     Returns:
@@ -2290,6 +2318,9 @@ def create_service(
     return MetaRecService(
             async_client, 
             sync_client,
+            summary_model,
+            planning_model,
+            llm_model,
             restaurant_data
     )
 
