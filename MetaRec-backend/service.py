@@ -2289,8 +2289,8 @@ def create_service(
     """
     return MetaRecService(
             async_client, 
-            sync_client
-            restaurant_data, 
+            sync_client,
+            restaurant_data
     )
 
 
