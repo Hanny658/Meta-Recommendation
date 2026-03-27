@@ -62,6 +62,7 @@ async_client = create_async_client()
 try:
     sync_client = create_sync_azure_client()
 except Exception as e:
+    print('[Warning] Unable to create AzureOpenAI client, falling back to OpenAI client')
     sync_client = create_sync_client()
 
 # ==================== 创建服务实例 ====================
