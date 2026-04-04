@@ -9,7 +9,7 @@
     "preview": "vite preview --port 5173",
     "test": "vitest run",
     "test:unit": "vitest run src/__tests__/api.unit.test.ts",
-    "test:render": "vitest run src/__tests__/homepage.render.test.tsx"
+    "test:render": "vitest run src/__tests__/*.test.tsx"
   },
   "dependencies": {
     "@types/react-rnd": "^7.4.4",
