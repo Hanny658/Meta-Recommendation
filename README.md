@@ -216,6 +216,19 @@ Run all backend categories together:
 python -m pytest -q -m "backend_unit or chain_standard or chain_retrial or chain_fallback"
 ```
 
+### GitHub Actions CI (6-way split + reports)
+
+CI workflow file: `.github/workflows/tests.yml`
+
+- `frontend_unit`
+- `frontend_render`
+- `backend_unit`
+- `backend_chain_standard`
+- `backend_chain_retrial`
+- `backend_chain_fallback`
+
+Each job emits a JUnit XML report artifact (`*-junit`), and a final `Test Report` job publishes a merged PR test summary from all XML files.
+
 ## 📄 License
 
 MIT License - see LICENSE file for details
