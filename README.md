@@ -233,17 +233,15 @@ python -m pytest -q -m "backend_unit or chain_standard or chain_retrial or chain
 - Any backend API schema/route change must regenerate contract artifacts:
   - `python MetaRec-backend/scripts/export_openapi.py`
   - `cd MetaRec-ui && npm run contract:gen`
-- Always commit both generated files in the same PR:
-  - `contracts/metarec-openapi.json`
-  - `MetaRec-ui/src/contracts/openapi-types.ts`
-- Run `npm run contract:check` before pushing; CI `contract_check` enforces the same drift check.
+- Run `npm run contract:check` before pushing; this validates generated types still compile.
+- CI contract checks are semantic-first (OpenAPI validate + type compile), not strict file-text matching.
 - For new frontend API calls, add runtime contract validation in `MetaRec-ui/src/utils/api.ts` via `parseWithContract(...)`.
 
 ### GitHub Actions CI
 
 CI workflow file: `.github/workflows/tests.yml`
 
-- `contract_check` (generates and verifies `contracts/metarec-openapi.json` and `MetaRec-ui/src/contracts/openapi-types.ts`)
+- `contract_check` (semantic validation: export OpenAPI, validate contract, generate frontend types, ensure type compile)
 - `frontend_unit`
 - `frontend_render`
 - `backend_unit`

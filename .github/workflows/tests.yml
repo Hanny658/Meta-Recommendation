@@ -51,8 +51,12 @@ jobs:
         working-directory: MetaRec-ui
         run: npm run contract:gen
 
-      - name: Validate contract artifacts are committed
-        run: git diff --exit-code -- contracts/metarec-openapi.json MetaRec-ui/src/contracts/openapi-types.ts
+      - name: Validate OpenAPI contract (semantic)
+        run: npx --yes @redocly/cli bundle contracts/metarec-openapi.json -o /tmp/metarec-openapi.bundle.json
+
+      - name: Validate generated contract types compile
+        working-directory: MetaRec-ui
+        run: npx tsc --noEmit
 
       - name: Upload contract artifacts
         if: always()

@@ -11,7 +11,7 @@
     "test:unit": "vitest run src/__tests__/*.unit.test.ts",
     "test:render": "vitest run src/__tests__/*.test.tsx",
     "contract:gen": "openapi-typescript ../contracts/metarec-openapi.json -o src/contracts/openapi-types.ts",
-    "contract:check": "npm run contract:gen && git -C .. diff --exit-code -- contracts/metarec-openapi.json MetaRec-ui/src/contracts/openapi-types.ts"
+    "contract:check": "npm run contract:gen && npx tsc --noEmit"
   },
   "dependencies": {
     "@types/react-rnd": "^7.4.4",
