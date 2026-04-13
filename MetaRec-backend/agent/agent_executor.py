@@ -12,6 +12,7 @@ from typing import Any, Dict, List, AsyncGenerator, Optional, Union
 from openai import OpenAI, AzureOpenAI
 from .agent_plan import run_demo
 from .agent_mcp.agent_google_map import search_google_maps
+from .agent_mcp.agent_yelp import search_yelp_organic_results
 from .agent_mcp.agent_xiaohongshu import search_notes_by_keyword
 from .agent_summary import summarize_recommendations
 
@@ -131,6 +132,14 @@ def dispatch_tool_call(name: str, parameters: Dict[str, Any]) -> Dict[str, Any]:
             result.update({"output": output, "success": output is not None})
             print("xhs.search success=%s, items=%s", result["success"], len(output) if output else 0)
             return result
+        
+        if name == "yelp.search":
+            query = parameters.get("query", "")
+            location = parameters.get("location", "")
+            output = search_yelp_organic_results(query=query, location=location, max_results=10)
+            result.update({"output": output, "success": output is not None})
+            print("yelp.search success=%s, items=%s", result["success"], len(output) if output else 0)
+            return result
 
         # 未知工具
         result.update({"error": f"Unknown tool: {name}"})
@@ -219,7 +228,10 @@ async def execute_offline_agent(
     # 提取工具名称
     tool_names = [call.get("name", "unknown") for call in plan_calls]
     tool_names_display = ", ".join([
-        name.replace("gmap.search", "Google Maps").replace("xhs.search", "Xiaohongshu") 
+        name\
+            .replace("gmap.search", "Google Maps")\
+            .replace("xhs.search", "Xiaohongshu")\
+            .replace("yelp.search", "Yelp") 
         for name in tool_names
     ])
     
@@ -244,7 +256,10 @@ async def execute_offline_agent(
     
     for idx, execution in enumerate(executions, start=1):
         tool_name = execution.get("tool", "unknown")
-        tool_display = tool_name.replace("gmap.search", "Google Maps").replace("xhs.search", "Xiaohongshu")
+        tool_display = tool_name\
+                .replace("gmap.search", "Google Maps")\
+                .replace("xhs.search", "Xiaohongshu")\
+                .replace("yelp.search", "Yelp")
         
         # 提取 query 和 results_count
         query = execution.get("input", {}).get("query", "")
@@ -268,6 +283,9 @@ async def execute_offline_agent(
             await asyncio.sleep(2.0)
         elif tool_name == "xhs.search":
             # 小红书搜索可能需要更长时间
+            await asyncio.sleep(3.0)
+        elif tool_name == "yelp.search":
+            # TODO: time for yelp calls?
             await asyncio.sleep(3.0)
         else:
             # 默认延迟
@@ -431,7 +449,10 @@ async def execute_online_agent(
         plan_calls = parse_planner_output(planning_resp)
         tool_names = [call.get("name", "unknown") for call in plan_calls]
         tool_names_display = ", ".join([
-            name.replace("gmap.search", "Google Maps").replace("xhs.search", "Xiaohongshu") 
+            name\
+                .replace("gmap.search", "Google Maps")\
+                .replace("xhs.search", "Xiaohongshu")\
+                .replace("yelp.search", "Yelp")\
             for name in tool_names
         ])
         
@@ -463,7 +484,10 @@ async def execute_online_agent(
     for idx, call in enumerate(plan_calls, start=1):
         name = call.get("name")
         params = call.get("parameters", {})
-        tool_display = name.replace("gmap.search", "Google Maps").replace("xhs.search", "Xiaohongshu")
+        tool_display = name\
+            .replace("gmap.search", "Google Maps")\
+            .replace("xhs.search", "Xiaohongshu")\
+            .replace("yelp.search", "Yelp")
         
         yield {
             "stage": "execution",
@@ -524,11 +548,14 @@ async def execute_online_agent(
         # 提取各工具输出
         gmap_results = None
         xhs_results = None
+        yelp_results = None
         for item in executions:
             if item.get("tool") == "gmap.search":
                 gmap_results = item.get("output")
             if item.get("tool") == "xhs.search":
                 xhs_results = item.get("output")
+            if item.get("tool") == "yelp.search":
+                yelp_results = item.get("output")
         
         summary_content = None
         if not summary_content:
@@ -540,6 +567,7 @@ async def execute_online_agent(
                 user_input, 
                 gmap_results, 
                 xhs_results,
+                yelp_results,
                 summary_model,
             )
             summary_content = summary_resp.choices[0].message.content if summary_resp and summary_resp.choices else None
